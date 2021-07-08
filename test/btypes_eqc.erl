@@ -32,10 +32,19 @@
 -type type_prop_name() :: binary().
 -type type_prop_val()  :: boolean().
 
+-define(QC_OUT(P),
+        eqc:on_output(fun(Str, Args) -> io:format(user, Str, Args) end, P)).
+
 -record(state, {
           %% a list of properties we have created
           types :: [{type_name(), type_active_status(), [{type_prop_name(), type_prop_val()}]}]
          }).
+
+btypes_test_() -> {
+              timeout, 60,
+              ?_test(?assert(
+                        eqc:quickcheck(?QC_OUT(eqc:testing_time(50, prop_btype_invariant())))))
+             }.
 
 run_eqc() ->
     run_eqc(100).
@@ -223,6 +232,23 @@ get_type_post(S, [TypeName], Res) ->
             good_props(Missing, Extra)
     end.
 
+%% ------ Grouped operator: fold
+
+%% @doc fold args generator
+fold_args(_S) -> [].
+
+%% @doc fold command
+fold() ->
+    ordsets:from_list(riak_core_bucket_type:fold(fun folder/2, [])).
+
+%% @doc fold callback which simply picks out the bucket type
+folder({BType, _BProps}, Accum) ->
+    [BType | Accum].
+
+%% @doc fold postcondition
+fold_post(#state{types=Types} = _S, [], Res) ->
+    eq(ordsets:from_list([BType || {BType, _Status, _BProps} <- Types]), Res).
+
 %% ------ test helpers
 
 expected_status(TypeName, S) ->
@@ -307,6 +333,7 @@ weight(_S, create_type) -> 3;
 weight(_S, activate_type) -> 3;
 weight(_S, type_status) -> 1;
 weight(_S, get_type) -> 1;
+weight(_S, fold) -> 1;
 weight(_S, _Cmd) -> 1.
 
 %% @doc the property
@@ -315,51 +342,14 @@ prop_btype_invariant() ->
             aggregate(command_names(Cmds),
                       ?TRAPEXIT(
                          begin
-                             meck:new(riak_core_capability, []),
-                             meck:expect(riak_core_capability, get,
-                                         fun({riak_core, bucket_types}) -> true;
-                                            (X) -> meck:passthrough([X]) end),
-                             os:cmd("rm -r ./btypes_eqc_meta"),
-                             application:set_env(riak_core, claimant_tick, 4294967295),
-                             application:set_env(riak_core, broadcast_lazy_timer, 4294967295),
-                             application:set_env(riak_core, broadcast_exchange_timer, 4294967295),
-                             application:set_env(riak_core, metadata_hashtree_timer, 4294967295),
-                             stop_pid(whereis(riak_core_ring_events)),
-                             stop_pid(whereis(riak_core_ring_manager)),
-                             {ok, RingEvents} = riak_core_ring_events:start_link(),
-                             {ok, _RingMgr} = riak_core_ring_manager:start_link(test),
-                             {ok, Claimant} = riak_core_claimant:start_link(),
-                             {ok, MetaMgr} = riak_core_metadata_manager:start_link([{data_dir, "./btypes_eqc_meta"}]),
-                             {ok, Hashtree} = riak_core_metadata_hashtree:start_link("./btypes_eqc_meta/trees"),
-                             {ok, Broadcast} = riak_core_broadcast:start_link(),
-                             {H, S, Res} = run_commands(?MODULE,Cmds),
-                             stop_pid(Broadcast),
-                             stop_pid(Hashtree),
-                             stop_pid(MetaMgr),
-                             stop_pid(Claimant),
-                             riak_core_ring_manager:stop(),
-                             stop_pid(RingEvents),
-                             os:cmd("rm -r ./btypes_eqc_meta"),
-                             meck:unload(riak_core_capability),
+                             {H, S, Res} =
+                                 bucket_eqc_utils:per_test_setup([],
+                                     fun() ->
+                                             run_commands(?MODULE,Cmds)
+                                     end),
                              pretty_commands(?MODULE, Cmds, {H, S, Res},
                                              Res == ok)
-                         end))).
-
-stop_pid(Other) when not is_pid(Other) ->
-    ok;
-stop_pid(Pid) ->
-    unlink(Pid),
-    exit(Pid, shutdown),
-    ok = wait_for_pid(Pid).
-
-wait_for_pid(Pid) ->
-    Mref = erlang:monitor(process, Pid),
-    receive
-        {'DOWN', Mref, process, _, _} ->
-            ok
-    after
-        5000 ->
-            {error, didnotexit}
-    end.
+                         end
+                        ))).
 
 -endif.

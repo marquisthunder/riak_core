@@ -18,7 +18,7 @@
 %% -------------------------------------------------------------------
 -module(riak_core_vnode_proxy).
 -export([start_link/2, init/1, reg_name/2, reg_name/3, call/2, call/3, cast/2,
-         unregister_vnode/3, command_return_vnode/2]).
+         unregister_vnode/3, command_return_vnode/2, overloaded/1]).
 -export([system_continue/3, system_terminate/4, system_code_change/4]).
 
 -include("riak_core_vnode.hrl").
@@ -105,6 +105,12 @@ unregister_vnode(Mod, Index, Pid) ->
 command_return_vnode({Mod,Index,Node}, Req) ->
     call(reg_name(Mod, Index, Node), {return_vnode, Req}).
 
+%% Return true if the next proxied message will return overload
+overloaded({Mod, Index, Node}) ->
+    call(reg_name(Mod, Index, Node), overloaded);
+overloaded(Pid) ->
+    call(Pid, overloaded).
+
 call(Name, Msg) ->
     call_reply(catch gen:call(Name, '$vnode_proxy_call', Msg)).
 
@@ -155,7 +161,10 @@ handle_call({return_vnode, Req}, _From, State) ->
     {Pid, NewState} = get_vnode_pid(State),
     gen_fsm:send_event(Pid, Req),
     {reply, {ok, Pid}, NewState};
-
+handle_call(overloaded, _From, State=#state{check_mailbox=Mailbox,
+                                            check_threshold=Threshold}) ->
+    Result = (Mailbox > Threshold),
+    {reply, Result, State};
 handle_call(_Msg, _From, State) ->
     {reply, ok, State}.
 
@@ -167,17 +176,15 @@ handle_cast({unregister_vnode, Pid}, State) ->
     catch demonitor(State#state.vnode_mref, [flush]),
     NewState = forget_vnode(State),
     {noreply, NewState};
-handle_cast({vnode_proxy_pong, Pid, Msgs}, State=#state{vnode_pid=VNodePid,
-                                                        check_request=RequestState,
+handle_cast({vnode_proxy_pong, Ref, Msgs}, State=#state{check_request=RequestState,
                                                         check_mailbox=Mailbox}) ->
-    ValidReply = (Pid =:= VNodePid) and (RequestState =:= sent),
-    NewState = case ValidReply of
-                   true ->
+    NewState = case Ref of
+                   RequestState ->
                        State#state{check_mailbox=Mailbox - Msgs,
                                    check_request=undefined,
                                    check_counter=0};
                    _ ->
-                       State#state{check_request=undefined}
+                       State
                end,
     {noreply, NewState};
 
@@ -219,6 +226,15 @@ handle_proxy(Msg, State=#state{check_counter=Counter,
             State2 = State
     end,
 
+    Mailbox2 = case Mailbox =< Threshold of
+                   true ->
+                       Pid ! Msg,
+                       Mailbox + 1;
+                   false ->
+                       handle_overload(Msg, State),
+                       Mailbox
+               end,
+
     Counter2 = Counter + 1,
     case Counter2 of
         RequestInterval ->
@@ -229,13 +245,11 @@ handle_proxy(Msg, State=#state{check_counter=Counter,
             %% we can adjust our mailbox estimate accordingly.
             case RequestState of
                 undefined ->
-                    Pid ! {'$vnode_proxy_ping', self(), Mailbox + 1},
-                    RequestState2 = sent,
-                    Mailbox2 = Mailbox + 2;
+                    RequestState2 = send_proxy_ping(Pid, Mailbox2);
                 _ ->
-                    Mailbox2 = Mailbox + 1,
                     RequestState2 = RequestState
             end,
+            Mailbox3 = Mailbox2,
             Counter3 = Counter2;
         Interval ->
             %% Time to directly check the mailbox size. This operation may
@@ -245,30 +259,19 @@ handle_proxy(Msg, State=#state{check_counter=Counter,
             {_, L} =
                 erlang:process_info(Pid, message_queue_len),
             Counter3 = 0,
-            Mailbox2 = L,
-            RequestState2 = case RequestState of
-                                sent ->
-                                    %% Ignore pending ping response as it is
-                                    %% no longer valid nor useful.
-                                    ignore;
-                                _ ->
-                                    RequestState
-                            end;
+            Mailbox3 = L + 1,
+            %% Send a new proxy ping so that if the new length is above the
+            %% threshold then the proxy will detect the work is completed,
+            %% rather than being stuck in overload state until the interval
+            %% counts are reached.
+            RequestState2 = send_proxy_ping(Pid, Mailbox3);
         _ ->
+            Mailbox3 = Mailbox2,
             Counter3 = Counter2,
-            Mailbox2 = Mailbox + 1,
             RequestState2 = RequestState
     end,
-
-    case Mailbox2 =< Threshold of
-        true ->
-            Pid ! Msg;
-        false ->
-            handle_overload(Msg, State)
-    end,
-
     {noreply, State2#state{check_counter=Counter3,
-                           check_mailbox=Mailbox2,
+                           check_mailbox=Mailbox3,
                            check_request=RequestState2}}.
 
 handle_overload(Msg, #state{mod=Mod, index=Index}) ->
@@ -276,10 +279,12 @@ handle_overload(Msg, #state{mod=Mod, index=Index}) ->
     case Msg of
         {'$gen_event', ?VNODE_REQ{sender=Sender, request=Request}} ->
             catch(Mod:handle_overload_command(Request, Sender, Index));
+        {'$gen_all_state_event', ?VNODE_REQ{sender=Sender, request=Request}} ->
+            catch(Mod:handle_overload_command(Request, Sender, Index));
         {'$gen_event', ?COVERAGE_REQ{sender=Sender, request=Request}} ->
             catch(Mod:handle_overload_command(Request, Sender, Index));
         _ ->
-            ok
+            catch(Mod:handle_overload_info(Msg, Index))
     end.
 
 %% @private
@@ -299,6 +304,12 @@ get_vnode_pid(State=#state{mod=Mod, index=Index, vnode_pid=undefined}) ->
 get_vnode_pid(State=#state{vnode_pid=Pid}) ->
     {Pid, State}.
 
+%% @private
+send_proxy_ping(Pid, MailboxSizeAfterPing) ->
+    Ref = make_ref(),
+    Pid ! {'$vnode_proxy_ping', self(), Ref, MailboxSizeAfterPing},
+    Ref.
+
 -ifdef(TEST).
 
 update_msg_counter() ->
@@ -317,6 +328,13 @@ fake_loop() ->
         {get_count, Pid} ->
             Pid ! {count, erlang:get(count)},
             fake_loop();
+        %% Original tests do not expect replies - the
+        %% results below expect the pings to be counted
+        %% towards messages received.  If you ever wanted
+        %% to re-instance, uncomment below.
+        %% {'$vnode_proxy_ping', ReplyTo, Ref, Msgs} ->
+        %%     ReplyTo ! {Ref, Msgs},
+        %%     fake_loop();
         _Msg ->
             update_msg_counter(),
             fake_loop()
@@ -340,17 +358,24 @@ overload_test_() ->
     {timeout, 900, {foreach,
      fun() ->
              VnodePid = spawn(fun fake_loop/0),
+             meck:unload(),
              meck:new(riak_core_vnode_manager, [passthrough]),
              meck:expect(riak_core_vnode_manager, get_vnode_pid,
                          fun(_Index, fakemod) -> {ok, VnodePid};
                             (Index, Mod) -> meck:passthrough([Index, Mod])
                          end),
+             meck:new(fakemod, [non_strict]),
+             meck:expect(fakemod, handle_overload_info, fun(hello, _Idx) ->
+                                                            ok
+                                                        end),
+
              {ok, ProxyPid} = riak_core_vnode_proxy:start_link(fakemod, 0),
              unlink(ProxyPid),
              {VnodePid, ProxyPid}
      end,
      fun({VnodePid, ProxyPid}) ->
-             meck:unload(riak_core_vnode_manager),
+             unlink(VnodePid),
+             unlink(ProxyPid),
              exit(VnodePid, kill),
              exit(ProxyPid, kill)
      end,
@@ -358,14 +383,21 @@ overload_test_() ->
       fun({_VnodePid, ProxyPid}) ->
               {"should not discard in normal operation", timeout, 60,
                fun() ->
-                       ToSend = ?DEFAULT_OVERLOAD_THRESHOLD-2,
+                       ToSend = ?DEFAULT_OVERLOAD_THRESHOLD,
                        [ProxyPid ! hello || _ <- lists:seq(1, ToSend)],
-                       %% synchronize on the mailbox
+
+                       %% synchronize on the proxy and the mailbox
+                       {ok, ok} = gen:call(ProxyPid, '$vnode_proxy_call', sync, infinity),
                        ProxyPid ! {get_count, self()},
                        receive
                            {count, Count} ->
-                               %% ToSend messages + 1 unanswered vnode_proxy_ping
-                               ?assertEqual(ToSend+1, Count)
+                               %% First will hit the request check interval,
+                               %% then will check message queue every interval
+                               %% (no new ping will be resubmitted after the first
+                               %% as the request will already have a reference)
+                               PingReqs = 1 + % for first request intarval
+                                   ToSend div ?DEFAULT_CHECK_INTERVAL,
+                               ?assertEqual(ToSend+PingReqs, Count)
                        end
                end
               }
@@ -375,15 +407,15 @@ overload_test_() ->
                fun() ->
                        VnodePid ! block,
                        [ProxyPid ! hello || _ <- lists:seq(1, 50000)],
-                       %% synchronize on the mailbox
+                       %% synchronize on the mailbox - no-op that hits msg catchall
                        Reply = gen:call(ProxyPid, '$vnode_proxy_call', sync, infinity),
                        ?assertEqual({ok, ok}, Reply),
                        VnodePid ! unblock,
                        VnodePid ! {get_count, self()},
                        receive
                            {count, Count} ->
-                               %% Threshold + 1 unanswered vnode_proxy_ping
-                               ?assertEqual(?DEFAULT_OVERLOAD_THRESHOLD + 1, Count)
+                               %% Threshold + 10 unanswered vnode_proxy_ping
+                               ?assertEqual(?DEFAULT_OVERLOAD_THRESHOLD + 10, Count)
                        end
                end
               }
@@ -393,15 +425,16 @@ overload_test_() ->
                fun() ->
                        VnodePid ! slow,
                        [ProxyPid ! hello || _ <- lists:seq(1, 50000)],
-                       %% synchronize on the mailbox
+                       %% synchronize on the mailbox - no-op that hits msg catchall
                        Reply = gen:call(ProxyPid, '$vnode_proxy_call', sync, infinity),
                        ?assertEqual({ok, ok}, Reply),
                        %% check that the outstanding message count is
                        %% reasonable
                        {message_queue_len, L} =
                            erlang:process_info(VnodePid, message_queue_len),
-                       %% Threshold + 1 unanswered vnode_proxy_ping
-                       ?assert(L =< (?DEFAULT_OVERLOAD_THRESHOLD + 1))
+                       %% Threshold + 2 unanswered vnode_proxy_ping (one
+                       %% for first ping, second after process_info check)
+                       ?assert(L =< (?DEFAULT_OVERLOAD_THRESHOLD + 2))
                end
               }
       end

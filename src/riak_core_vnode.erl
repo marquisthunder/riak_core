@@ -19,7 +19,6 @@
 -module('riak_core_vnode').
 -behaviour(gen_fsm).
 -include("riak_core_vnode.hrl").
--export([behaviour_info/1]).
 -export([start_link/3,
          start_link/4,
          wait_for_init/1,
@@ -38,6 +37,7 @@
 -export([reply/2,
          monitor/1]).
 -export([get_mod_index/1,
+         get_modstate/1,
          set_forwarding/2,
          trigger_handoff/2,
          trigger_handoff/3,
@@ -64,23 +64,65 @@
         (R == normal orelse R == shutdown orelse
                                             (is_tuple(R) andalso element(1,R) == shutdown))).
 
--spec behaviour_info(atom()) -> 'undefined' | [{atom(), arity()}].
-behaviour_info(callbacks) ->
-    [{init,1},
-     {handle_command,3},
-     {handle_coverage,4},
-     {handle_exit,3},
-     {handoff_starting,2},
-     {handoff_cancelled,1},
-     {handoff_finished,2},
-     {handle_handoff_command,3},
-     {handle_handoff_data,2},
-     {encode_handoff_item,2},
-     {is_empty,1},
-     {terminate,2},
-     {delete,1}];
-behaviour_info(_Other) ->
-    undefined.
+-export_type([vnode_opt/0, pool_opt/0]).
+
+-type vnode_opt() :: pool_opt().
+-type pool_opt() :: {pool, WorkerModule::module(), PoolSize::pos_integer(), WorkerArgs::[term()]}.
+
+-callback init([partition()]) ->
+    {ok, ModState::term()} |
+    {ok, ModState::term(), [vnode_opt()]} |
+    {error, Reason::term()}.
+
+-callback handle_command(Request::term(), Sender::sender(), ModState::term()) ->
+    continue |
+    {reply, Reply::term(), NewModState::term()} |
+    {noreply, NewModState::term()} |
+    {async, Work::function(), From::sender(), NewModState::term()} |
+    {stop, Reason::term(), NewModState::term()}.
+
+-callback handle_coverage(Request::term(), keyspaces(), Sender::sender(), ModState::term()) ->
+    continue |
+    {reply, Reply::term(), NewModState::term()} |
+    {noreply, NewModState::term()} |
+    {async, Work::function(), From::sender(), NewModState::term()} |
+    {stop, Reason::term(), NewModState::term()}.
+
+-callback handle_exit(pid(), Reason::term(), ModState::term()) ->
+    {noreply, NewModState::term()} |
+    {stop, Reason::term(), NewModState::term()}.
+
+-callback handoff_starting(handoff_dest(), ModState::term()) ->
+    {boolean(), NewModState::term()}.
+
+-callback handoff_cancelled(ModState::term()) ->
+    {ok, NewModState::term()}.
+
+-callback handoff_finished(handoff_dest(), ModState::term()) ->
+    {ok, NewModState::term()}.
+
+-callback handle_handoff_command(Request::term(), Sender::sender(), ModState::term()) ->
+    {reply, Reply::term(), NewModState::term()} |
+    {noreply, NewModState::term()} |
+    {async, Work::function(), From::sender(), NewModState::term()} |
+    {forward, NewModState::term()} |
+    {drop, NewModState::term()} |
+    {stop, Reason::term(), NewModState::term()}.
+
+-callback handle_handoff_data(binary(), ModState::term()) ->
+    {reply, ok | {error, Reason::term()}, NewModState::term()}.
+
+-callback encode_handoff_item(Key::term(), Value::term()) ->
+    corrupted | binary().
+
+-callback is_empty(ModState::term()) ->
+    {boolean(), NewModState::term()} |
+    {false, Size::pos_integer(), NewModState::term()}.
+
+-callback terminate(Reason::term(), ModState::term()) ->
+    ok.
+
+-callback delete(ModState::term()) -> {ok, NewModState::term()}.
 
 %% handle_exit/3 is an optional behaviour callback that can be implemented.
 %% It will be called in the case that a process that is linked to the vnode
@@ -114,11 +156,11 @@ behaviour_info(_Other) ->
           forward :: node() | [{integer(), node()}],
           handoff_target=none :: none | {integer(), node()},
           handoff_pid :: pid(),
-          handoff_type :: hinted_handoff | ownership_transfer | resize_transfer,
+          handoff_type :: riak_core_handoff_manager:ho_type(),
           pool_pid :: pid() | undefined,
           pool_config :: tuple() | undefined,
           manager_event_timer :: reference(),
-          inactivity_timeout :: non_neg_integer() 
+          inactivity_timeout :: non_neg_integer()
          }).
 
 start_link(Mod, Index, Forward) ->
@@ -271,11 +313,11 @@ forward_or_vnode_command(Sender, Request, State=#state{forward=Forward,
                                                        mod=Mod,
                                                        index=Index}) ->
     Resizing = is_list(Forward),
-    case Resizing of
+    RequestHash = case Resizing of
         true ->
-            RequestHash = Mod:request_hash(Request);
+            Mod:request_hash(Request);
         false ->
-            RequestHash = undefined
+            undefined
     end,
     Forwardable = is_request_forwardable(Request),
     case {Forwardable, Forward, RequestHash} of
@@ -283,7 +325,7 @@ forward_or_vnode_command(Sender, Request, State=#state{forward=Forward,
         {false, _, _} -> vnode_command(Sender, Request, State);
         %% typical vnode operation, no forwarding set, handle request locally
         {_, undefined, _} -> vnode_command(Sender, Request, State);
-        %% implicit forwarding after ownership_transfer/hinted_handoff
+        %% implicit forwarding after ownership transfer/hinted handoff
         {_, F, _} when not is_list(F) ->
             vnode_forward(implicit, {Index, Forward}, Sender, Request, State),
             continue(State);
@@ -376,23 +418,29 @@ vnode_handoff_command(Sender, Request, ForwardTo,
             riak_core_vnode_worker_pool:handle_work(Pool, Work, From),
             continue(State, NewModState);
         {forward, NewModState} ->
-            case HOType of
-                %% resize op and transfer ongoing
-                resize_transfer -> vnode_forward(resize, ForwardTo, Sender,
-                                                 {resize_forward, Request}, State);
-                %% resize op ongoing, no resize transfer ongoing, arrive here
-                %% via forward_or_vnode_command
-                undefined -> vnode_forward(resize, ForwardTo, Sender,
-                                           {resize_forward, Request}, State);
-                %% normal explicit forwarding during ownership transfer
-                _ -> vnode_forward(explicit, HOTarget, Sender, Request, State)
-            end,
+            forward_request(HOType, Request, HOTarget, ForwardTo, Sender, State),
+            continue(State, NewModState);
+ 	{forward, NewReq, NewModState} ->
+            forward_request(HOType, NewReq, HOTarget, ForwardTo, Sender, State),
             continue(State, NewModState);
         {drop, NewModState} ->
             continue(State, NewModState);
         {stop, Reason, NewModState} ->
             {stop, Reason, State#state{modstate=NewModState}}
     end.
+
+%% @private wrap the request for resize forwards, and use the resize
+%% target.
+forward_request(resize, Request, _HOTarget, ResizeTarget, Sender, State) ->
+    %% resize op and transfer ongoing
+    vnode_forward(resize, ResizeTarget, Sender, {resize_forward, Request}, State);
+forward_request(undefined, Request, _HOTarget, ResizeTarget, Sender, State) ->
+    %% resize op ongoing, no resize transfer ongoing, arrive here
+    %% via forward_or_vnode_command
+    vnode_forward(resize, ResizeTarget, Sender, {resize_forward, Request}, State);
+forward_request(_, Request, HOTarget, _ResizeTarget, Sender, State) ->
+    %% normal explicit forwarding during owhership transfer
+    vnode_forward(explicit, HOTarget, Sender, Request, State).
 
 vnode_forward(Type, ForwardTo, Sender, Request, State) ->
     lager:debug("Forwarding (~p) {~p,~p} -> ~p~n",
@@ -427,7 +475,7 @@ active(?VNODE_REQ{sender=Sender, request=Request},
        State=#state{handoff_target=HT}) when HT =:= none ->
     forward_or_vnode_command(Sender, Request, State);
 active(?VNODE_REQ{sender=Sender, request=Request},
-                  State=#state{handoff_type=resize_transfer,
+                  State=#state{handoff_type=resize,
                                handoff_target={HOIdx,HONode},
                                index=Index,
                                forward=Forward,
@@ -505,7 +553,7 @@ active(_Event, _From, State) ->
 %% manager. Blocking the manager can impact all vnodes. This code is safe
 %% to execute on multiple parallel vnodes because of the synchronization
 %% afforded by having all ring changes go through the single ring manager.
-mark_handoff_complete(SrcIdx, Target, SeenIdxs, Mod, resize_transfer) ->
+mark_handoff_complete(SrcIdx, Target, SeenIdxs, Mod, resize) ->
     Prev = node(),
     Source = {SrcIdx, Prev},
     Result = riak_core_ring_manager:ring_trans(
@@ -767,8 +815,8 @@ handle_sync_event(core_status, _From, StateName, State=#state{index=Index,
         end,
     {reply, {Mode, Status}, StateName, State, State#state.inactivity_timeout}.
 
-handle_info({'$vnode_proxy_ping', From, Msgs}, StateName, State) ->
-    riak_core_vnode_proxy:cast(From, {vnode_proxy_pong, self(), Msgs}),
+handle_info({'$vnode_proxy_ping', From, Ref, Msgs}, StateName, State) ->
+    riak_core_vnode_proxy:cast(From, {vnode_proxy_pong, Ref, Msgs}),
     {next_state, StateName, State, State#state.inactivity_timeout};
 
 handle_info({'EXIT', Pid, Reason},
@@ -849,7 +897,7 @@ terminate(Reason, _StateName, #state{mod=Mod, modstate=ModState,
                 ok
         end
     catch C:T ->
-        lager:error("Error while shutting down vnode worker pool ~p:~p trace : ~p", 
+        lager:error("Error while shutting down vnode worker pool ~p:~p trace : ~p",
                     [C, T, erlang:get_stacktrace()])
     after
         case ModState of
@@ -889,9 +937,9 @@ maybe_handoff(TargetIdx, TargetNode,
             Resizing = riak_core_ring:is_resizing(R),
             Primary = riak_core_ring:is_primary(R, {Idx, node()}),
             HOType = case {Resizing, Primary} of
-                         {true, _} -> resize_transfer;
-                         {_, true} -> ownership_transfer;
-                         {_, false} -> hinted_handoff
+                         {true, _} -> resize;
+                         {_, true} -> ownership;
+                         {_, false} -> hinted
                      end,
             case Mod:handoff_starting({HOType, Target}, ModState) of
                 {true, NewModState} ->
@@ -997,6 +1045,8 @@ is_request_forwardable(_) ->
     %%          v4 and v27 as well as any other vnode request type.
     true.
 
+mod_set_forwarding(_Forward, State=#state{modstate={deleted,_}}) ->
+    State;
 mod_set_forwarding(Forward, State=#state{mod=Mod, modstate=ModState}) ->
     case lists:member({set_vnode_forwarding, 2}, Mod:module_info(exports)) of
         true ->
@@ -1010,6 +1060,12 @@ mod_set_forwarding(Forward, State=#state{mod=Mod, modstate=ModState}) ->
 %% Test API
 %% ===================================================================
 
+%% @doc Reveal the underlying module state for testing
+-spec(get_modstate(pid()) -> {atom(), #state{}}).
+get_modstate(Pid) ->
+    {_StateName, State} = gen_fsm:sync_send_all_state_event(Pid, current_state),
+    {State#state.mod, State#state.modstate}.
+
 -ifdef(TEST).
 
 %% Start the garbage collection server
@@ -1022,6 +1078,7 @@ current_state(Pid) ->
     gen_fsm:sync_send_all_state_event(Pid, current_state).
 
 pool_death_test() ->
+    meck:unload(),
     meck:new(test_vnode, [non_strict, no_link]),
     meck:expect(test_vnode, init, fun(_) -> {ok, [], [{pool, test_pool_mod, 1, []}]} end),
     meck:expect(test_vnode, terminate, fun(_, _) -> normal end),
@@ -1041,9 +1098,7 @@ pool_death_test() ->
     exit(Pid, normal),
     wait_for_process_death(Pid),
     meck:validate(test_pool_mod),
-    meck:validate(test_vnode),
-    meck:unload(test_pool_mod),
-    meck:unload(test_vnode).
+    meck:validate(test_vnode).
 
 wait_for_process_death(Pid) ->
     wait_for_process_death(Pid, is_process_alive(Pid)).

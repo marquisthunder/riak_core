@@ -1,8 +1,6 @@
 %% -------------------------------------------------------------------
 %%
-%% riak_core: Core Riak Application
-%%
-%% Copyright (c) 2007-2013 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2007-2016 Basho Technologies, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -38,8 +36,16 @@
          start_app_deps/1,
          build_tree/3,
          orddict_delta/2,
+         safe_rpc/4,
+         safe_rpc/5,
          rpc_every_member/4,
          rpc_every_member_ann/4,
+         count/2,
+         keydelete/2,
+         multi_keydelete/2,
+         multi_keydelete/3,
+         compose/1,
+         compose/2,
          pmap/2,
          pmap/3,
          multi_rpc/4,
@@ -58,15 +64,28 @@
          make_fold_req/1,
          make_fold_req/2,
          make_fold_req/4,
-         make_newest_fold_req/1
+         make_newest_fold_req/1,
+         proxy_spawn/1,
+         proxy/2,
+         enable_job_class/1,
+         enable_job_class/2,
+         disable_job_class/1,
+         disable_job_class/2,
+         job_class_enabled/1,
+         job_class_enabled/2,
+         job_class_disabled_message/2,
+         report_job_request_disposition/6
         ]).
 
 -include("riak_core_vnode.hrl").
 
 -ifdef(TEST).
+-ifdef(EQC).
+-include_lib("eqc/include/eqc.hrl").
+-endif. %% EQC
 -include_lib("eunit/include/eunit.hrl").
 -export([counter_loop/1,incr_counter/1,decr_counter/1]).
--endif.
+-endif. %% TEST
 
 %% R14 Compatibility
 -compile({no_auto_import,[integer_to_list/2]}).
@@ -84,7 +103,7 @@
 %%      number of seconds from year 0 to now, universal time, in
 %%      the gregorian calendar.
 
-moment() -> 
+moment() ->
     {Mega, Sec, _Micro} = os:timestamp(),
     (Mega * 1000000) + Sec + ?SEC_TO_EPOCH.
 
@@ -122,24 +141,31 @@ make_tmp_dir() ->
             TempDir
     end.
 
+%% @doc Atomically/safely (to some reasonable level of durablity)
+%% replace file `FN' with `Data'. NOTE: since 2.0.3 semantic changed
+%% slightly: If `FN' cannot be opened, will not error with a
+%% `badmatch', as before, but will instead return `{error, Reason}'
 -spec replace_file(string(), iodata()) -> ok | {error, term()}.
-
 replace_file(FN, Data) ->
     TmpFN = FN ++ ".tmp",
-    {ok, FH} = file:open(TmpFN, [write, raw]),
-    try
-        ok = file:write(FH, Data),
-        ok = file:sync(FH),
-        ok = file:close(FH),
-        ok = file:rename(TmpFN, FN),
-        {ok, Contents} = read_file(FN),
-        true = (Contents == iolist_to_binary(Data)),
-        ok
-    catch _:Err ->
-            {error, Err}
+    case file:open(TmpFN, [write, raw]) of
+        {ok, FH} ->
+            try
+                ok = file:write(FH, Data),
+                ok = file:sync(FH),
+                ok = file:close(FH),
+                ok = file:rename(TmpFN, FN),
+                {ok, Contents} = read_file(FN),
+                true = (Contents == iolist_to_binary(Data)),
+                ok
+            catch _:Err ->
+                    {error, Err}
+            end;
+        Err ->
+            Err
     end.
 
-%% @doc Similar to {@link file:read_file} but uses raw file I/O
+%% @doc Similar to {@link file:read_file/1} but uses raw file `I/O'
 read_file(FName) ->
     {ok, FD} = file:open(FName, [read, raw, binary]),
     IOList = read_file(FD, []),
@@ -219,8 +245,8 @@ unique_id_62() ->
 %%      and code:load_file/1 on each node.
 reload_all(Module) ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
-    [{rpc:call(Node, code, purge, [Module]),
-     rpc:call(Node, code, load_file, [Module])} ||
+    [{safe_rpc(Node, code, purge, [Module]),
+     safe_rpc(Node, code, load_file, [Module])} ||
         Node <- riak_core_ring:all_members(Ring)].
 
 %% @spec mkclientid(RemoteNode :: term()) -> ClientID :: list()
@@ -236,8 +262,8 @@ mkclientid(RemoteNode) ->
 chash_key({Bucket,_Key}=BKey) ->
     BucketProps = riak_core_bucket:get_bucket(Bucket),
     chash_key(BKey, BucketProps).
-    
-%% @spec chash_key(BKey :: riak_object:bkey(), [{atom(), any()}]) -> 
+
+%% @spec chash_key(BKey :: riak_object:bkey(), [{atom(), any()}]) ->
 %%          chash:index()
 %% @doc Create a binary used for determining replica placement.
 chash_key({Bucket,Key}, BucketProps) ->
@@ -284,7 +310,7 @@ start_app_deps(App) ->
     {ok, DepApps} = application:get_key(App, applications),
     _ = [ensure_started(A) || A <- DepApps],
     ok.
-    
+
 
 %% @spec ensure_started(Application :: atom()) -> ok
 %% @doc Start the named application if not already started.
@@ -296,21 +322,79 @@ ensure_started(App) ->
 	    ok
     end.
 
+%% @doc Applies `Pred' to each element in `List', and returns a count of how many
+%% applications returned `true'.
+-spec count(fun((term()) -> boolean()), [term()]) -> non_neg_integer().
+count(Pred, List) ->
+    FoldFun = fun(E, A) ->
+                      case Pred(E) of
+                          false -> A;
+                          true -> A + 1
+                      end
+              end,
+    lists:foldl(FoldFun, 0, List).
+
+%% @doc Returns a copy of `TupleList' where the first occurrence of a tuple whose
+%% first element compares equal to `Key' is deleted, if there is such a tuple.
+%% Equivalent to `lists:keydelete(Key, 1, TupleList)'.
+-spec keydelete(atom(), [tuple()]) -> [tuple()].
+keydelete(Key, TupleList) ->
+    lists:keydelete(Key, 1, TupleList).
+
+%% @doc Returns a copy of `TupleList' where the first occurrence of a tuple whose
+%% first element compares equal to any key in `KeysToDelete' is deleted, if
+%% there is such a tuple.
+-spec multi_keydelete([atom()], [tuple()]) -> [tuple()].
+multi_keydelete(KeysToDelete, TupleList) ->
+    multi_keydelete(KeysToDelete, 1, TupleList).
+
+%% @doc Returns a copy of `TupleList' where the Nth occurrence of a tuple whose
+%% first element compares equal to any key in `KeysToDelete' is deleted, if
+%% there is such a tuple.
+-spec multi_keydelete([atom()], non_neg_integer(), [tuple()]) -> [tuple()].
+multi_keydelete(KeysToDelete, N, TupleList) ->
+    lists:foldl(
+      fun(Key, Acc) -> lists:keydelete(Key, N, Acc) end,
+      TupleList,
+      KeysToDelete).
+
+%% @doc Function composition: returns a function that is the composition of
+%% `F' and `G'.
+-spec compose(F :: fun((B) -> C), G :: fun((A) -> B)) -> fun((A) -> C).
+compose(F, G) when is_function(F, 1), is_function(G, 1) ->
+    fun(X) ->
+        F(G(X))
+    end.
+
+%% @doc Function composition: returns a function that is the composition of all
+%% functions in the `Funs' list. Note that functions are composed from right to
+%% left, so the final function in the `Funs' will be the first one invoked when
+%% invoking the composed function.
+-spec compose([fun((any()) -> any())]) -> fun((any()) -> any()).
+compose([Fun]) ->
+    Fun;
+compose(Funs) when is_list(Funs) ->
+    [Fun|Rest] = lists:reverse(Funs),
+    lists:foldl(fun compose/2, Fun, Rest).
+
 %% @doc Invoke function `F' over each element of list `L' in parallel,
 %%      returning the results in the same order as the input list.
--spec pmap(function(), [node()]) -> [any()].
+-spec pmap(F, L1) -> L2 when
+      F :: fun((A) -> B),
+      L1 :: [A],
+      L2 :: [B].
 pmap(F, L) ->
     Parent = self(),
     lists:foldl(
       fun(X, N) ->
-              spawn(fun() ->
-                            Parent ! {pmap, N, F(X)}
-                    end),
+              spawn_link(fun() ->
+                                 Parent ! {pmap, N, F(X)}
+                         end),
               N+1
       end, 0, L),
     L2 = [receive {pmap, N, R} -> {N,R} end || _ <- L],
-    {_, L3} = lists:unzip(lists:keysort(1, L2)),
-    L3.
+    L3 = lists:keysort(1, L2),
+    [R || {_,R} <- L3].
 
 -record(pmap_acc,{
                   mapper,
@@ -389,6 +473,36 @@ pmap_collect_rest(Pending, Done) ->
     end.
 
 
+%% @doc Wraps an rpc:call/4 in a try/catch to handle the case where the
+%%      'rex' process is not running on the remote node. This is safe in
+%%      the sense that it won't crash the calling process if the rex
+%%      process is down.
+-spec safe_rpc(Node :: node(), Module :: atom(), Function :: atom(),
+        Args :: [any()]) -> {'badrpc', any()} | any().
+safe_rpc(Node, Module, Function, Args) ->
+    try rpc:call(Node, Module, Function, Args) of
+        Result ->
+            Result
+    catch
+        exit:{noproc, _NoProcDetails} ->
+            {badrpc, rpc_process_down}
+    end.
+
+%% @doc Wraps an rpc:call/5 in a try/catch to handle the case where the
+%%      'rex' process is not running on the remote node. This is safe in
+%%      the sense that it won't crash the calling process if the rex
+%%      process is down.
+-spec safe_rpc(Node :: node(), Module :: atom(), Function :: atom(),
+        Args :: [any()], Timeout :: timeout()) -> {'badrpc', any()} | any().
+safe_rpc(Node, Module, Function, Args, Timeout) ->
+    try rpc:call(Node, Module, Function, Args, Timeout) of
+        Result ->
+            Result
+    catch
+        'EXIT':{noproc, _NoProcDetails} ->
+            {badrpc, rpc_process_down}
+    end.
+
 %% @spec rpc_every_member(atom(), atom(), [term()], integer()|infinity)
 %%          -> {Results::[term()], BadNodes::[node()]}
 %% @doc Make an RPC call to the given module and function on each
@@ -418,7 +532,7 @@ multi_rpc(Nodes, Mod, Fun, Args) ->
 -spec multi_rpc([node()], module(), atom(), [any()], timeout()) -> [any()].
 multi_rpc(Nodes, Mod, Fun, Args, Timeout) ->
     pmap(fun(Node) ->
-                 rpc:call(Node, Mod, Fun, Args, Timeout)
+                 safe_rpc(Node, Mod, Fun, Args, Timeout)
          end, Nodes).
 
 %% @doc Perform an RPC call to a list of nodes in parallel, returning the
@@ -475,7 +589,7 @@ multicall_ann(Nodes, Mod, Fun, Args, Timeout) ->
                 -> orddict:orddict().
 build_tree(N, Nodes, Opts) ->
     case lists:member(cycles, Opts) of
-        true -> 
+        true ->
             Expand = lists:flatten(lists:duplicate(N+1, Nodes));
         false ->
             Expand = Nodes
@@ -578,6 +692,23 @@ make_newest_fold_req(#riak_core_fold_req_v1{foldfun=FoldFun, acc0=Acc0}) ->
 make_newest_fold_req(?FOLD_REQ{} = F) ->
     F.
 
+%% @doc Spawn an intermediate proxy process to handle errors during gen_xxx
+%%      calls.
+proxy_spawn(Fun) ->
+    %% Note: using spawn_monitor does not trigger selective receive
+    %%       optimization, but spawn + monitor does. Silly Erlang.
+    Pid = spawn(?MODULE, proxy, [self(), Fun]),
+    MRef = monitor(process, Pid),
+    Pid ! {proxy, MRef},
+    receive
+        {proxy_reply, MRef, Result} ->
+            demonitor(MRef, [flush]),
+            Result;
+        {'DOWN', MRef, _, _, Reason} ->
+            {error, Reason}
+    end.
+
+
 %% @private
 make_fold_reqv(v1, FoldFun, Acc0, _Forwardable, _Opts)
   when is_function(FoldFun, 3) ->
@@ -588,6 +719,152 @@ make_fold_reqv(v2, FoldFun, Acc0, Forwardable, Opts)
        andalso is_list(Opts) ->
     ?FOLD_REQ{foldfun=FoldFun, acc0=Acc0,
               forwardable=Forwardable, opts=Opts}.
+
+%% @private - used with proxy_spawn
+proxy(Parent, Fun) ->
+    _ = monitor(process, Parent),
+    receive
+        {proxy, MRef} ->
+            Result = Fun(),
+            Parent ! {proxy_reply, MRef, Result};
+        {'DOWN', _, _, _, _} ->
+            ok
+    end.
+
+-spec enable_job_class(atom(), atom()) -> ok | {error, term()}.
+%% @doc Enables the specified Application/Operation job class.
+%% This is the public API for use via RPC.
+%% WARNING: This function is not suitable for parallel execution with itself
+%% or its complement disable_job_class/2.
+enable_job_class(Application, Operation)
+        when erlang:is_atom(Application) andalso erlang:is_atom(Operation) ->
+    enable_job_class({Application, Operation});
+enable_job_class(Application, Operation) ->
+    {error, {badarg, {Application, Operation}}}.
+
+-spec disable_job_class(atom(), atom()) -> ok | {error, term()}.
+%% @doc Disables the specified Application/Operation job class.
+%% This is the public API for use via RPC.
+%% WARNING: This function is not suitable for parallel execution with itself
+%% or its complement enable_job_class/2.
+disable_job_class(Application, Operation)
+        when erlang:is_atom(Application) andalso erlang:is_atom(Operation) ->
+    disable_job_class({Application, Operation});
+disable_job_class(Application, Operation) ->
+    {error, {badarg, {Application, Operation}}}.
+
+-spec job_class_enabled(atom(), atom()) -> boolean() | {error, term()}.
+%% @doc Reports whether the specified Application/Operation job class is enabled.
+%% This is the public API for use via RPC.
+job_class_enabled(Application, Operation)
+        when erlang:is_atom(Application) andalso erlang:is_atom(Operation) ->
+    job_class_enabled({Application, Operation});
+job_class_enabled(Application, Operation) ->
+    {error, {badarg, {Application, Operation}}}.
+
+-spec enable_job_class(Class :: term()) -> ok | {error, term()}.
+%% @doc Internal API to enable the specified job class.
+%% WARNING:
+%% * This function may not remain in this form once the Jobs API is live!
+%% * Parameter types ARE NOT validated by the same rules as the public API!
+%% You are STRONGLY advised to use enable_job_class/2.
+enable_job_class(Class) ->
+    case app_helper:get_env(riak_core, job_accept_class) of
+        [_|_] = EnabledClasses ->
+            case lists:member(Class, EnabledClasses) of
+                true ->
+                    ok;
+                _ ->
+                    application:set_env(
+                        riak_core, job_accept_class, [Class | EnabledClasses])
+            end;
+        _ ->
+            application:set_env(riak_core, job_accept_class, [Class])
+    end.
+
+-spec disable_job_class(Class :: term()) -> ok | {error, term()}.
+%% @doc Internal API to disable the specified job class.
+%% WARNING:
+%% * This function may not remain in this form once the Jobs API is live!
+%% * Parameter types ARE NOT validated by the same rules as the public API!
+%% You are STRONGLY advised to use disable_job_class/2.
+disable_job_class(Class) ->
+    case app_helper:get_env(riak_core, job_accept_class) of
+        [_|_] = EnabledClasses ->
+            case lists:member(Class, EnabledClasses) of
+                false ->
+                    ok;
+                _ ->
+                    application:set_env(riak_core, job_accept_class,
+                        lists:delete(Class, EnabledClasses))
+            end;
+        _ ->
+            ok
+    end.
+
+-spec job_class_enabled(Class :: term()) -> boolean().
+%% @doc Internal API to determine whether to accept/reject a job.
+%% WARNING:
+%% * This function may not remain in this form once the Jobs API is live!
+%% * Parameter types ARE NOT validated by the same rules as the public API!
+%% You are STRONGLY advised to use job_class_enabled/2.
+job_class_enabled(Class) ->
+    case app_helper:get_env(riak_core, job_accept_class) of
+        undefined ->
+            true;
+        [] ->
+            false;
+        [_|_] = EnabledClasses ->
+            lists:member(Class, EnabledClasses);
+        Other ->
+            % Don't crash if it's not a list - that should never be the case,
+            % but since the value *can* be manipulated externally be more
+            % accommodating. If someone mucks it up, nothing's going to be
+            % allowed, but give them a chance to catch on instead of crashing.
+            _ = lager:error(
+                "riak_core.job_accept_class is not a list: ~p", [Other]),
+            false
+    end.
+
+-spec job_class_disabled_message(ReturnType :: atom(), Class :: term())
+        -> binary() | string().
+%% @doc The error message to be returned to a client for a disabled job class.
+%% WARNING:
+%% * This function is likely to be extended to accept a Job as well as a Class
+%%   when the Jobs API is live.
+job_class_disabled_message(binary, Class) ->
+    erlang:list_to_binary(job_class_disabled_message(text, Class));
+job_class_disabled_message(text, Class) ->
+    lists:flatten(io_lib:format("Operation '~p' is not enabled", [Class])).
+
+-spec report_job_request_disposition(Accepted :: boolean(), Class :: term(),
+    Mod :: module(), Func :: atom(), Line :: pos_integer(), Client :: term())
+        -> ok | {error, term()}.
+%% @doc Report/record the disposition of an async job request.
+%%
+%% Logs an appropriate message and reports to whoever needs to know.
+%% WARNING:
+%% * This function is likely to be extended to accept a Job as well as a Class
+%%   when the Jobs API is live.
+%%
+%% Parameters:
+%%  * Accepted - Whether the specified job Class is enabled.
+%%  * Class - The Class of the job, by convention {Application, Operation}.
+%%  * Mod/Func/Line - The Module, function, and source line number,
+%%    respectively, that will be reported as the source of the call.
+%%  * Client - Any term indicating the originator of the request.
+%%    By convention, when meaningful client identification information is not
+%%    available, Client is an atom representing the protocol through which the
+%%    request was received.
+%%
+report_job_request_disposition(true, Class, Mod, Func, Line, Client) ->
+    lager:log(debug,
+        [{pid, erlang:self()}, {module, Mod}, {function, Func}, {line, Line}],
+        "Request '~p' accepted from ~p", [Class, Client]);
+report_job_request_disposition(false, Class, Mod, Func, Line, Client) ->
+    lager:log(warning,
+        [{pid, erlang:self()}, {module, Mod}, {function, Func}, {line, Line}],
+        "Request '~p' disabled from ~p", [Class, Client]).
 
 %% ===================================================================
 %% EUnit tests
@@ -672,6 +949,72 @@ incr_counter(CounterPid) ->
 decr_counter(CounterPid) ->
     CounterPid ! down.
 
+multi_keydelete_test_() ->
+    Languages = [{lisp, 1958},
+                 {ml, 1973},
+                 {erlang, 1986},
+                 {haskell, 1990},
+                 {ocaml, 1996},
+                 {clojure, 2007},
+                 {elixir, 2012}],
+    ?_assertMatch(
+       [{lisp, _}, {ml, _}, {erlang, _}, {haskell, _}],
+       multi_keydelete([ocaml, clojure, elixir], Languages)).
+
+compose_test_() ->
+    Upper = fun string:to_upper/1,
+    Reverse = fun lists:reverse/1,
+    Strip = fun(S) -> string:strip(S, both, $!) end,
+    StripReverseUpper = compose([Upper, Reverse, Strip]),
+
+    Increment = fun(N) when is_integer(N) -> N + 1 end,
+    Double = fun(N) when is_integer(N) -> N * 2 end,
+    Square = fun(N) when is_integer(N) -> N * N end,
+    SquareDoubleIncrement = compose([Increment, Double, Square]),
+
+    CompatibleTypes = compose(Increment,
+                              fun(X) when is_list(X) -> list_to_integer(X) end),
+    IncompatibleTypes = compose(Increment,
+                                fun(X) when is_binary(X) -> binary_to_list(X) end),
+    [?_assertEqual("DLROW OLLEH", StripReverseUpper("Hello world!")),
+     ?_assertEqual(Increment(Double(Square(3))), SquareDoubleIncrement(3)),
+     ?_assertMatch(4, CompatibleTypes("3")),
+     ?_assertError(function_clause, IncompatibleTypes(<<"42">>)),
+     ?_assertError(function_clause, compose(fun(X, Y) -> {X, Y} end, fun(X) -> X end))].
+
+pmap_test_() ->
+    Fgood = fun(X) -> 2 * X end,
+    Fbad = fun(3) -> throw(die_on_3);
+              (X) -> Fgood(X)
+           end,
+    Lin = [1,2,3,4],
+    Lout = [2,4,6,8],
+    {setup,
+     fun() -> error_logger:tty(false) end,
+     fun(_) -> error_logger:tty(true) end,
+     [fun() ->
+              % Test simple map case
+              ?assertEqual(Lout, pmap(Fgood, Lin)),
+              % Verify a crashing process will not stall pmap
+              Parent = self(),
+              Pid = spawn(fun() ->
+                                  % Caller trapping exits causes stall!!
+                                  % TODO: Consider pmapping in a spawned proc
+                                  % process_flag(trap_exit, true),
+                                  pmap(Fbad, Lin),
+                                  ?debugMsg("pmap finished just fine"),
+                                  Parent ! no_crash_yo
+                          end),
+              MonRef = monitor(process, Pid),
+              receive
+                  {'DOWN', MonRef, _, _, _} ->
+                      ok;
+                  no_crash_yo ->
+                      ?assert(pmap_did_not_crash_as_expected)
+              end
+      end
+     ]}.
+
 bounded_pmap_test_() ->
     Fun1 = fun(X) -> X+2 end,
     Tests =
@@ -717,10 +1060,11 @@ bounded_pmap_test_() ->
 make_fold_req_test_() ->
     {setup,
      fun() ->
+             meck:unload(),
              meck:new(riak_core_capability, [passthrough])
      end,
      fun(_) ->
-             meck:unload(riak_core_capability)
+             ok
      end,
      [
       fun() ->
@@ -739,7 +1083,7 @@ make_fold_req_test_() ->
                        end,
 
               meck:expect(riak_core_capability, get,
-                          fun(_, _) -> v1 end),
+                          fun({riak_core, fold_req_version}, _) -> v1 end),
               F_1         = make_fold_req(F_1),
               F_1         = make_fold_req(F_2),
               F_1         = make_fold_req(FoldFun, Acc0),
@@ -747,15 +1091,44 @@ make_fold_req_test_() ->
               ok = Newest(),
 
               meck:expect(riak_core_capability, get,
-                          fun(_, _) -> v2 end),
+                          fun({riak_core, fold_req_version}, _) -> v2 end),
               F_2_default = make_fold_req(F_1),
               F_2         = make_fold_req(F_2),
               F_2_default = make_fold_req(FoldFun, Acc0),
               F_2         = make_fold_req(FoldFun, Acc0, Forw, Opts),
-              ok = Newest()
+              ok = Newest(),
+              %% It seems you could unload `meck' in the test teardown,
+              %% but that sometimes causes the eunit process to crash.
+              %% Instead, unload at end of test.
+              meck:unload()
       end
      ]
     }.
 
--endif.
+proxy_spawn_test() ->
+    A = proxy_spawn(fun() -> a end),
+    ?assertEqual(a, A),
+    B = proxy_spawn(fun() -> exit(killer_fun) end),
+    ?assertEqual({error, killer_fun}, B),
 
+    %% Ensure no errant 'DOWN' messages
+    receive
+        {'DOWN', _, _, _, _}=Msg ->
+            throw({error, {badmsg, Msg}});
+        _ ->
+            ok
+    after 1000 ->
+        ok
+    end.
+
+-ifdef(EQC).
+
+count_test() ->
+    ?assert(eqc:quickcheck(prop_count_correct())).
+
+prop_count_correct() ->
+    ?FORALL(List, list(bool()),
+            count(fun(E) -> E end, List) =:= length([E || E <- List, E])).
+
+-endif. %% EQC
+-endif. %% TEST

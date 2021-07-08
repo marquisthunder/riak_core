@@ -21,7 +21,8 @@
 ]}.
 
 %% ring_size validators
-{validator, "ring_size_max", "2048 and larger are supported, but considered advanced config",
+{validator, "ring_size_max",
+ "2048 and larger are supported, but considered advanced config",
  fun(Size) ->
   Size =< 1024
  end}.
@@ -71,6 +72,25 @@
   {commented, "$(platform_etc_dir)/cacertfile.pem"}
 ]}.
 
+%% @doc handoff.ip is the network address that Riak binds to for
+%% intra-cluster data handoff.
+{mapping, "handoff.ip", "riak_core.handoff_ip", [
+  {default, "{{handoff_ip}}" },
+  {datatype, string},
+  {validators, ["valid_ipaddr"]},
+  hidden
+]}.
+
+{validator,
+  "valid_ipaddr",
+  "must be a valid IP address",
+  fun(AddrString) ->
+    case inet_parse:address(AddrString) of
+      {ok, _} -> true;
+      {error, _} -> false
+    end
+  end}.
+
 %% @doc handoff.port is the TCP port that Riak uses for
 %% intra-cluster data handoff.
 {mapping, "handoff.port", "riak_core.handoff_port", [
@@ -92,6 +112,24 @@
 %% @doc if you need a seperate keyfile for handoff
 {mapping, "handoff.ssl.keyfile", "riak_core.handoff_ssl_options.keyfile", [
   {datatype, file},
+  hidden
+]}.
+
+%% @doc Enables/disables outbound handoff transfers for this node. If you
+%% turn this setting off at runtime with riak-admin, it will kill any
+%% outbound handoffs currently running.
+{mapping, "handoff.outbound", "riak_core.disable_outbound_handoff", [
+  {default, on},
+  {datatype, {flag, off, on}},
+  hidden
+]}.
+
+%% @doc Enables/disables inbound handoff transfers for this node. If you
+%% turn this setting off at runtime with riak-admin, it will kill any
+%% inbound handoffs currently running.
+{mapping, "handoff.inbound", "riak_core.disable_inbound_handoff", [
+  {default, on},
+  {datatype, {flag, off, on}},
   hidden
 ]}.
 
@@ -150,6 +188,69 @@
 %% use of the background manager.
 {mapping, "background_manager", "riak_core.use_background_manager", [
     {datatype, flag},
-    {default, on},
+    {default, off},
     hidden
 ]}.
+
+%% @doc Interval of time between vnode management
+%% activities. Modifying this will change the amount of time between
+%% attemps to trigger handoff between this node and any other member
+%% of the cluster.
+{mapping, "vnode_management_timer", "riak_core.vnode_management_timer", [
+    {default, "10s"},
+    {datatype, {duration, ms}},
+    hidden
+]}.
+
+%% Async Job Management
+%%
+%% This is a translation for mappings that appear in other schema files.
+%% Mappings are from "cluster.job.$namespace.$operation"* to
+%% "riak_core.job_accept_class" with required attributes
+%%  [merge, {datatype, {flag, enabled, disabled}}].**
+%% *  Mappings are only performed on elements with exactly the number of
+%%    segments shown - any other number of elements, even with a matching
+%%    prefix, is ignored.
+%% ** The 'datatype' should be 'flag', and 'enabled'/'disabled' are our
+%%    conventions, but any OnFlag/OffFlag pair can be used as long as they map
+%%    to boolean values.
+%% Other attributes, such as 'hidden' or {default, X} are fine, since they
+%% don't make it down the stack to here.
+%% Job classes that should be enabled by default MUST have a {default, enabled}
+%% attribute, as the runtime filter only defaults to accept when no values have
+%% been set from ANY schema file.
+%%
+%% Example:
+%%  {mapping, "cluster.job.harry.fold", "riak_core.job_accept_class", [
+%%      merge,
+%%      {datatype, {flag, enabled, disabled}},
+%%      {default, enabled}
+%%  ]}.
+%%  {mapping, "cluster.job.alice.list", "riak_core.job_accept_class", [
+%%      merge,
+%%      {datatype, {flag, enabled, disabled}},
+%%      {default, disabled}
+%%  ]}.
+%% Results in:
+%%  {riak_core, [
+%%      ...
+%%      {job_accept_class, [{harry, fold}]}
+%%      ...
+%%  ]}.
+%%
+{translation,
+ "riak_core.job_accept_class",
+ fun(Conf) ->
+    Fold =
+     fun({[_, _, Mod, Op], true}, Result) ->
+            [{erlang:list_to_atom(Mod), erlang:list_to_atom(Op)} | Result];
+        ({[_, _, _, _], false}, Result) ->
+            Result;
+        ({[_, _, _, _], _} = Setting, _) ->
+            cuttlefish:invalid(io_lib:format("~p", [Setting]));
+        (_, Result) ->
+            Result
+    end,
+    lists:sort(lists:foldl(Fold, [],
+        cuttlefish_variable:filter_by_prefix(["cluster", "job"], Conf)))
+ end}.

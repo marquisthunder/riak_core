@@ -12,7 +12,7 @@
 %% specific language governing permissions and limitations
 %% under the License.
 
-%% Copyright (c) 2007-2010 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2007-2015 Basho Technologies, Inc.  All Rights Reserved.
 
 -module(riak_core_ring_handler).
 -behaviour(gen_event).
@@ -65,36 +65,55 @@ ensure_vnodes_started(Ring) ->
         AppMods ->
             case ensure_vnodes_started(AppMods, Ring, []) of
                 [] ->
-                    Legacy = riak_core_gossip:legacy_gossip(),
                     Ready = riak_core_ring:ring_ready(Ring),
                     FutureIndices = riak_core_ring:future_indices(Ring, node()),
                     Status = riak_core_ring:member_status(Ring, node()),
-                    case {Legacy, Ready, FutureIndices, Status} of
-                        {true, _, _, _} ->
-                            riak_core_ring_manager:refresh_my_ring();
-                        {_, true, [], leaving} ->
-                            riak_core_ring_manager:ring_trans(
-                              fun(Ring2, _) -> 
-                                      Ring3 = riak_core_ring:exit_member(node(), Ring2, node()),
-                                      {new_ring, Ring3}
-                              end, []),
-                            %% Shutdown if we are the only node in the cluster
-                            case riak_core_ring:random_other_node(Ring) of
-                                no_node ->
-                                    riak_core_ring_manager:refresh_my_ring();
-                                _ ->
+                    case {Ready, FutureIndices, Status} of
+                        {true, [], leaving} ->
+                            case ready_to_exit(AppMods) of
+                                true ->
+                                    exit_ring_trans(),
+                                    maybe_shutdown(Ring);
+                                false ->
                                     ok
                             end;
-                        {_, _, _, invalid} ->
+                        {_, _, invalid} ->
                             riak_core_ring_manager:refresh_my_ring();
-                        {_, _, _, exiting} ->
+                        {_, _, exiting} ->
                             %% Deliberately do nothing.
                             ok;
-                        {_, _, _, _} ->
+                        {_, _, _} ->
                             ok
                     end;
                 _ -> ok
             end
+    end.
+
+%% Shutdown if we are the only node in the cluster
+maybe_shutdown(Ring) ->
+    case riak_core_ring:random_other_node(Ring) of
+        no_node ->
+            riak_core_ring_manager:refresh_my_ring();
+        _ ->
+            ok
+    end.
+
+exit_ring_trans() ->
+    riak_core_ring_manager:ring_trans(
+        fun(Ring2, _) -> 
+                Ring3 = riak_core_ring:exit_member(node(), Ring2, node()),
+                {new_ring, Ring3}
+        end, []).
+
+ready_to_exit([]) ->
+    true;
+ready_to_exit([{_App, Mod} | AppMods]) ->
+    case erlang:function_exported(Mod, ready_to_exit, 0) andalso
+             (not Mod:ready_to_exit()) of 
+        true ->
+            false;
+        false ->
+            ready_to_exit(AppMods)
     end.
 
 ensure_vnodes_started([], _Ring, Acc) ->
